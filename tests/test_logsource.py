@@ -8,21 +8,15 @@ import unittest
 from unittest import mock
 
 from caddymon import logsource
-from caddymon.logsource import follow, parse_line
+from caddymon.logsource import follow_many, is_rotated, parse_line, site_labels
 from caddymon.stats import Stats
 from caddymon.text import clean
 
 
 def lines_until(gen, n):
-    """Next ``n`` real lines from a follow() generator, skipping idle ticks."""
-    got = []
-    for _ in range(500):
-        line = next(gen)
-        if line is not None:
-            got.append(line)
-            if len(got) == n:
-                return got
-    raise AssertionError(f"only got {got}")
+    """Next ``n`` real lines from a one-file follow_many() generator, without
+    their path and skipping idle ticks."""
+    return [line for _path, line in items_until(gen, n)]
 
 
 class ParseLineTests(unittest.TestCase):
@@ -31,6 +25,8 @@ class ParseLineTests(unittest.TestCase):
                          '{"method":"GET","remote_ip":"45.148.10.23","uri":"/.env"}}')
         self.assertEqual((rec.status, rec.method, rec.ip, rec.uri), (404, "GET", "45.148.10.23", "/.env"))
         self.assertRegex(rec.time, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertEqual(rec.site, "")
+        self.assertEqual(parse_line('{"status":200}', "www.example.com").site, "www.example.com")
 
     def test_non_access_lines_are_dropped(self):
         for line in ["", "   ", "garbage", "[1,2]", '"text"', '{"msg":"no status"}',
@@ -87,7 +83,7 @@ class FollowTests(unittest.TestCase):
             f.write(data)
 
     def test_missing_file_still_ticks(self):
-        gen = follow(self.path, from_start=True, poll=0.01)
+        gen = follow_many([self.path], from_start=True, poll=0.01)
         self.addCleanup(gen.close)
         # Must hand control back (None) rather than block while missing.
         self.assertIsNone(next(gen))
@@ -97,7 +93,7 @@ class FollowTests(unittest.TestCase):
 
     def test_tail_mode_skips_existing_content(self):
         self.write(b"old\n")
-        gen = follow(self.path, from_start=False, poll=0.01)
+        gen = follow_many([self.path], from_start=False, poll=0.01)
         self.addCleanup(gen.close)
         self.assertIsNone(next(gen))
         self.write(b"new\n")
@@ -105,7 +101,7 @@ class FollowTests(unittest.TestCase):
 
     def test_partial_line_waits_for_newline(self):
         self.write(b"")
-        gen = follow(self.path, from_start=True, poll=0.01)
+        gen = follow_many([self.path], from_start=True, poll=0.01)
         self.addCleanup(gen.close)
         self.write(b"hel")
         self.assertIsNone(next(gen))
@@ -117,7 +113,7 @@ class FollowTests(unittest.TestCase):
         # is switched. Simulated through os.stat (which also reports the new
         # inode) because Windows can't rename a file that's held open.
         self.write(b"a\n")
-        gen = follow(self.path, from_start=True, poll=0.01)
+        gen = follow_many([self.path], from_start=True, poll=0.01)
         self.addCleanup(gen.close)
         self.assertEqual(lines_until(gen, 1), ["a"])
         self.assertIsNone(next(gen))
@@ -139,7 +135,7 @@ class FollowTests(unittest.TestCase):
 
     def test_truncation_drops_stale_partial_line(self):
         self.write(b"one\n")
-        gen = follow(self.path, from_start=True, poll=0.01)
+        gen = follow_many([self.path], from_start=True, poll=0.01)
         self.addCleanup(gen.close)
         self.assertEqual(lines_until(gen, 1), ["one"])
         self.write(b"partial")
@@ -151,14 +147,123 @@ class FollowTests(unittest.TestCase):
         with open(self.path, "wb") as f:
             for i in range(60000):  # ~4 MB: several 1 MiB reads
                 f.write(b'{"status":200,"request":{"uri":"/%d"}}\n' % i)
-        gen = follow(self.path, from_start=True, poll=0.01)
+        gen = follow_many([self.path], from_start=True, poll=0.01)
         self.addCleanup(gen.close)
         count = 0
-        for line in gen:
-            if line is None:
+        for item in gen:
+            if item is None:
                 break
             count += 1
         self.assertEqual(count, 60000)
+
+
+    @mock.patch.object(logsource.Follower, "READ_CHUNK", 8)
+    @mock.patch.object(logsource.Follower, "MAX_LINE", 16)
+    def test_over_long_line_is_dropped_and_memory_bounded(self):
+        # A file with no newlines (the wrong file, say) mustn't be buffered
+        # whole: the over-long line is dropped up to its newline.
+        self.write(b"a\n" + b"x" * 200 + b"\nb\n" + b"y" * 200)
+        follower = logsource.Follower(self.path, from_start=True)
+        self.addCleanup(follower.close)
+        got, biggest = [], 0
+        while True:
+            lines = follower.step()
+            if lines is None:
+                break
+            got += lines
+            biggest = max(biggest, len(follower._buf))
+        self.assertEqual(got, ["a", "b"])
+        self.assertLessEqual(biggest, 16)
+        self.write(b"\nc\n")  # the second over-long line ends; then a real one
+        self.assertEqual(follower.step(), ["c"])
+
+
+class FollowManyTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def path(self, name):
+        return os.path.join(self.dir.name, name)
+
+    def test_files_take_turns(self):
+        # A big backlog in one log mustn't hold up the others: one chunk each.
+        big, small = self.path("big.log"), self.path("small.log")
+        with open(big, "wb") as f:
+            for i in range(40000):  # ~4 MB: several 1 MiB reads
+                f.write(b"%099d\n" % i)
+        with open(small, "wb") as f:
+            f.write(b"hello\n")
+        gen = follow_many([big, small], from_start=True, poll=0.01)
+        self.addCleanup(gen.close)
+        seen = []
+        for item in gen:
+            if item is None:
+                break
+            seen.append(item[0])
+        self.assertEqual(seen.count(big), 40000)
+        self.assertLess(seen.index(small), 20000)  # after big's first chunk
+
+    def test_lines_are_tagged_and_missing_files_wait(self):
+        a, b = self.path("a.log"), self.path("b.log")
+        gen = follow_many([a, b], from_start=True, poll=0.01)
+        self.addCleanup(gen.close)
+        self.assertIsNone(next(gen))  # both missing: still ticks
+        with open(b, "wb") as f:
+            f.write(b"from-b\n")
+        self.assertEqual(items_until(gen, 1), [(b, "from-b")])
+        with open(a, "wb") as f:
+            f.write(b"from-a\n")
+        self.assertEqual(items_until(gen, 1), [(a, "from-a")])
+
+    def test_is_rotated(self):
+        for name, rotated in [
+            ("www.example.com.log", False),
+            ("access.log", False),
+            ("www.example.com-2026-10-01T12-00-00.000.log", True),
+            ("access-2026-10-01T12-00-00.000.log.gz", True),
+            ("access-2026-10-01T12-00-00.000", True),
+            ("2026-10-01.log", False),
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(is_rotated(os.path.join("/var/log/caddy", name)), rotated)
+
+    def test_site_labels(self):
+        self.assertEqual(
+            site_labels(["/var/log/caddy/www.example.com.log", "/var/log/caddy/shop.example.com.log"]),
+            {"/var/log/caddy/www.example.com.log": "www.example.com",
+             "/var/log/caddy/shop.example.com.log": "shop.example.com"})
+        # Same file name in different folders: the folder tells them apart.
+        self.assertEqual(
+            list(site_labels(["/srv/a.com/access.log", "/srv/b.com/access.log", "x.json"]).values()),
+            ["a.com/access", "b.com/access", "x.json"])
+        # Still the same one folder up: as many folders as it takes.
+        self.assertEqual(
+            list(site_labels(["/srv/a/logs/access.log", "/var/b/logs/access.log",
+                              "/srv/a/logs/other.log"]).values()),
+            ["a/logs/access", "b/logs/access", "other"])
+        # Only the ".log" differs: keep it rather than give two logs one label.
+        # (Full path by then, so "C:/x/..." on Windows.)
+        labels = list(site_labels(["/x/a", "/x/a.log"]).values())
+        self.assertNotEqual(labels[0], labels[1])
+        self.assertTrue(labels[0].endswith("x/a") and labels[1].endswith("x/a.log"), labels)
+
+    def test_site_labels_are_cleaned(self):
+        # File names are outside text too: no escape sequences to the terminal.
+        label = site_labels(["/var/log/evil\x1b]0;pwned\x07.log"])["/var/log/evil\x1b]0;pwned\x07.log"]
+        self.assertEqual(label, "evil?]0;pwned?")
+
+
+def items_until(gen, n):
+    """Next ``n`` real items from a follow_many() generator, skipping idle ticks."""
+    got = []
+    for _ in range(500):
+        item = next(gen)
+        if item is not None:
+            got.append(item)
+            if len(got) == n:
+                return got
+    raise AssertionError(f"only got {got}")
 
 
 if __name__ == "__main__":

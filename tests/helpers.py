@@ -101,7 +101,7 @@ class Term:
     cursor positioning, erase-to-EOL, clear, and the alt-screen/autowrap modes.
     Raises if anything is written past the last column (it would wrap)."""
 
-    TOKEN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]|\n|[^\x1b\n]")
+    TOKEN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\n|[^\x1b\n]")
 
     def __init__(self, cols: int, rows: int):
         self.cols, self.rows = cols, rows

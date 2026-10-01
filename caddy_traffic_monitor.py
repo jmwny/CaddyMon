@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Caddy Traffic Monitor.
 
-Tail a Caddy JSON access log and show live traffic in an htop-style terminal
-view: a one-line header (totals, a rolling 60 s request rate with sparkline,
+Tail one or more Caddy JSON access logs (e.g. one per site) and show live
+traffic in an htop-style terminal view: a one-line header (the log name or the
+number of sites, totals, a rolling 60 s request rate with sparkline,
 per-class counts), a pane of client IPs grouped with per-class counts, last
 seen, a scanner flag, and who owns each IP, a pane of the newest requests, and
-a footer of the keys that work right now. When stdout isn't a terminal it just
+a footer of the keys that work right now. With several logs, each request shows
+which site's log it came from, IPs that hit more than one site are marked, and
+the summary breaks the totals down by site. When stdout isn't a terminal it just
 prints a plain color-coded request stream instead. An on-exit summary is always
 shown.
 
@@ -15,24 +18,29 @@ focus (``←``/``→`` switch it; End returns the requests to live); ``Enter``
 narrows the request pane to the
 selected IP and ``Esc`` returns to all IPs; ``Tab`` cycles the layout (split /
 IPs only / requests only); ``a``/``0`` all status codes, ``2``-``5`` only that
-class; ``s`` toggles the IP sort (most recent / most hits); ``q`` quits.
+class; ``f`` (several logs only) cycles through the sites, narrowing both panes
+and the header to one; ``s`` toggles the IP sort (most recent / most hits);
+``q`` quits.
 
 IP owners come from RDAP (the regional internet registries, via rdap.org) plus
 reverse DNS, looked up in the background only for IPs being shown, and cached.
 ``--no-lookup`` disables all such network queries.
 
 This is a pure-Python rewrite of the original Bash tool: it has no external
-dependencies (no ``jq``, ``tail``, or ``stdbuf``) and follows the log file
-natively, surviving Caddy's default log rotation.
+dependencies (no ``jq``, ``tail``, or ``stdbuf``) and follows the log files
+natively, surviving Caddy's default log rotation. Copies Caddy has already
+rotated away (``name-2026-10-01T12-00-00.000.log``) are skipped unless
+``--from-start`` is given.
 
 Usage:
-    sudo python3 caddy_traffic_monitor.py [LOG_FILE] [options]
+    sudo python3 caddy_traffic_monitor.py [LOG_FILE ...] [options]
 
 Examples:
     sudo python3 caddy_traffic_monitor.py
     sudo python3 caddy_traffic_monitor.py /var/log/caddy/access.log
+    sudo python3 caddy_traffic_monitor.py /var/log/caddy/*.log
     sudo python3 caddy_traffic_monitor.py --layout ips --from-start
-    python3 caddy_traffic_monitor.py --from-start --no-color < dump.log
+    python3 caddy_traffic_monitor.py - --no-color < dump.log
     CADDY_LOG_FILE=/path/to.log python3 caddy_traffic_monitor.py
 """
 

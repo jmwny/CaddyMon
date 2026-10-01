@@ -71,8 +71,7 @@ class RateLimited(Exception):
     many seconds until asking again is worthwhile."""
 
     def __init__(self, host: str, retry_in: float):
-        super().__init__(host)
-        self.host = host
+        super().__init__(host)  # str(exc) names the host
         self.retry_in = retry_in
 
 
@@ -131,6 +130,12 @@ class RateLimiter:
 
     def delay(self, host: str) -> float:
         """Seconds until a request to ``host`` would be allowed (0 = now)."""
+        # Locked: another worker's acquire() may be appending to (or trimming)
+        # this host's send times, and iterating a deque mid-change raises.
+        with self._lock:
+            return self._delay(host)
+
+    def _delay(self, host: str) -> float:  # caller holds the lock
         now = time.monotonic()
         wait = self._blocked.get(host, 0.0) - now
         sent = self._sent.get(host, ())
@@ -145,7 +150,7 @@ class RateLimiter:
     def acquire(self, host: str) -> None:
         while True:
             with self._lock:
-                wait = self.delay(host)
+                wait = self._delay(host)
                 if wait <= 0:
                     sent = self._sent.setdefault(host, deque())
                     now = time.monotonic()
@@ -206,8 +211,12 @@ class RangeCache:
         self._save_lock = threading.Lock()
         self._dirty = False
         self._last_save = time.monotonic()
+        # Bumped whenever the ranges change, so callers can memoise get()
+        # answers until there's something new (OwnerResolver.lookup does).
+        self.generation = 0
 
     def _store(self, net, value) -> None:  # caller holds the lock
+        self.generation += 1
         self._nets[net] = value
         lengths = self._prefixes[net.version]
         if net.prefixlen not in lengths:
@@ -440,6 +449,8 @@ class OwnerResolver:
         self.ranges = ranges if ranges is not None else RangeCache()
         self.updated = False
         self._cache: dict[str, str] = {}
+        # ip -> (ranges.generation, text): lookup()'s answer while pending
+        self._provisional: dict = {}
         self._retry_at: dict[str, float] = {}  # ip -> monotonic time to retry
         self._pending: set[str] = set()
         self._wanted: dict[str, float] = {}  # ip -> last time lookup() asked
@@ -464,13 +475,23 @@ class OwnerResolver:
     def lookup(self, ip: str) -> str | None:
         """Owner text for ``ip``: cached result, an offline label or cached
         block owner, "" when nothing can be known, or None while a lookup is
-        still pending."""
-        addr = self._parse(ip)
-        if addr is None:
-            return ""
-        if not self.enabled:  # local knowledge only, no network
-            return offline_label(addr) or self.ranges.get(addr)[1] or ""
+        still pending.
+
+        Called for every visible IP on every frame, so the local answers are
+        memoised: with lookups off in ``_cache`` (the ranges can't change
+        without lookups), and while a lookup is pending in ``_provisional``,
+        keyed on ``ranges.generation`` so a sibling's new answer shows up."""
         cached = self._cache.get(ip)
+        if not self.enabled:  # local knowledge only, no network
+            if cached is None:
+                addr = self._parse(ip)
+                cached = self._cache[ip] = "" if addr is None else (
+                    offline_label(addr) or self.ranges.get(addr)[1] or "")
+            return cached
+        if cached is None:
+            addr = self._parse(ip)
+            if addr is None:
+                return ""
         now = time.monotonic()
         with self._lock:
             self._wanted[ip] = now  # still on screen
@@ -485,9 +506,15 @@ class OwnerResolver:
                 self._queue.put(ip)
                 self._start_workers()
         if cached is not None:
+            self._provisional.pop(ip, None)  # answered: the guess is done with
             return cached
         # Provisional while lookups run (the range lookup only happens here).
-        return offline_label(addr) or self.ranges.get(addr)[1]
+        generation = self.ranges.generation
+        memo = self._provisional.get(ip)
+        if memo is None or memo[0] != generation:
+            memo = self._provisional[ip] = (
+                generation, offline_label(addr) or self.ranges.get(addr)[1])
+        return memo[1]
 
     def wait(self, ips, timeout: float) -> None:
         """Queue lookups for ``ips`` and wait (up to ``timeout``) for them."""
@@ -505,6 +532,7 @@ class OwnerResolver:
         with self._lock:
             for ip in ips:
                 self._cache.pop(ip, None)
+                self._provisional.pop(ip, None)
                 self._retry_at.pop(ip, None)
                 self._wanted.pop(ip, None)
 

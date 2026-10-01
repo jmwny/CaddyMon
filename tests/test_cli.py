@@ -1,15 +1,24 @@
-"""End-to-end runs of caddy_traffic_monitor.py (plain/piped mode, no network:
-every run uses --no-lookup, and the cache is either off or a temp file)."""
+"""The command line (caddymon.cli): argument handling and log resolution
+in-process, plus end-to-end runs of caddy_traffic_monitor.py (plain/piped
+mode, no network: every run uses --no-lookup, and the cache is either off or
+a temp file)."""
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
+
+from caddymon.cli import DEFAULT_LOG, parse_args, resolve_logs
+from caddymon.output import Palette
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "caddy_traffic_monitor.py")
@@ -29,6 +38,86 @@ def run(*args, stdin=None, env=None, timeout=30):
                           text=True, encoding="utf-8", env=full_env, timeout=timeout)
 
 
+def run_until(*args, want, timeout=20):
+    """Start a run that follows logs (so it never ends by itself), wait until
+    every string in ``want`` has appeared on stdout or stderr, then kill it.
+    Returns everything it printed (stdout, then stderr)."""
+    proc = subprocess.Popen([sys.executable, SCRIPT, *args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    out, err = [], []
+    readers = [threading.Thread(target=lambda s=s, buf=buf: buf.extend(s), daemon=True)
+               for s, buf in ((proc.stdout, out), (proc.stderr, err))]
+    for reader in readers:
+        reader.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while not all(w in "".join(out + err) for w in want):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                raise AssertionError(f"never saw {want}:\n{''.join(out + err)}")
+            time.sleep(0.05)
+    finally:
+        proc.kill()
+        proc.wait()
+        for reader in readers:
+            reader.join(5)
+        proc.stdout.close()
+        proc.stderr.close()
+    return "".join(out + err)
+
+
+class ResolveLogsTests(unittest.TestCase):
+    """cli.resolve_logs(), in-process: which logs get followed, and the errors
+    and notes on stderr (main() returns 1 when it gives None)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.live = self.touch("www.example.com.log")
+        self.rotated = self.touch("www.example.com-2026-09-30T00-00-00.000.log")
+
+    def touch(self, name):
+        path = os.path.join(self.dir, name)
+        open(path, "w").close()
+        return path
+
+    def resolve(self, paths, from_start=False):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = resolve_logs(paths, from_start, Palette(False))
+        return result, err.getvalue()
+
+    def test_rotated_logs_are_skipped_when_tailing(self):
+        result, err = self.resolve([self.live, self.rotated])
+        self.assertEqual(result, [self.live])
+        self.assertIn("skipping 1 rotated log(s): www.example.com-2026", err)
+
+    def test_rotated_logs_are_read_with_from_start(self):
+        result, err = self.resolve([self.live, self.rotated], from_start=True)
+        self.assertEqual(result, [self.live, self.rotated])
+        self.assertEqual(err, "")
+
+    def test_only_rotated_logs_is_an_error_when_tailing(self):
+        result, err = self.resolve([self.rotated])
+        self.assertIsNone(result)
+        self.assertIn("--from-start", err)
+
+    def test_one_of_several_logs_missing(self):
+        result, err = self.resolve([self.live, os.path.join(self.dir, "gone.log")])
+        self.assertIsNone(result)
+        self.assertIn("gone.log", err)
+
+    def test_paths_in_messages_are_cleaned(self):
+        result, err = self.resolve([os.path.join(self.dir, "evil\x1b]0;pwned\x07.log")])
+        self.assertIsNone(result)
+        self.assertIn("evil?]0;pwned?.log", err)
+        self.assertNotIn("\x07", err)
+
+    def test_stdin_passes_through(self):
+        self.assertEqual(self.resolve(["-"]), (["-"], ""))
+
+
 class CliTests(unittest.TestCase):
     def test_plain_replay_and_summary(self):
         res = run("-", "--no-lookup", "--no-cache", stdin=SAMPLE)
@@ -40,12 +129,6 @@ class CliTests(unittest.TestCase):
         self.assertIn("└─ private network", out)
         self.assertIn("── Top denied IPs (403) ──", out)
         self.assertNotIn("garbage", out)
-
-    def test_obsolete_summary_option_is_harmless(self):
-        res = run("-", "--no-lookup", "--no-cache", "-n", "5", stdin=SAMPLE,
-                  env={"SUMMARY_EVERY": "10s"})
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertNotIn("--summary-every", run("--help").stdout)
 
     def test_poll_must_be_positive(self):
         for value in ("0", "-1", "nan", "inf", "x"):
@@ -59,6 +142,29 @@ class CliTests(unittest.TestCase):
             res = run(os.path.join(tmp, "nope.log"), "--from-start", "--no-cache", timeout=10)
         self.assertEqual(res.returncode, 1)
         self.assertIn("not found", res.stderr)
+
+    def test_several_logs_stream_with_a_site_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for site, ip in (("www.example.com", "8.8.8.8"), ("shop.example.com", "1.1.1.1")):
+                paths.append(os.path.join(tmp, site + ".log"))
+                with open(paths[-1], "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"ts": 1790000000, "status": 404, "request": {
+                        "method": "GET", "remote_ip": ip, "uri": "/" + site}}) + "\n")
+            out = run_until(*paths, "--from-start", "--no-lookup", "--no-cache",
+                            want=["GET    www.example.com  8.8.8.8",
+                                  "GET    shop.example.com 1.1.1.1"])
+        self.assertIn("Logs: ", out)
+        self.assertIn("SITE", out)
+
+    def test_log_list_arguments(self):
+        with mock.patch.dict(os.environ, {"CADDY_LOG_FILE": os.pathsep.join(["a.log", "b.log"])}):
+            self.assertEqual(parse_args([]).log_files, ["a.log", "b.log"])
+        with mock.patch.dict(os.environ, {"CADDY_LOG_FILE": ""}):
+            self.assertEqual(parse_args([]).log_files, [DEFAULT_LOG])
+        self.assertEqual(parse_args(["a.log", "./a.log", "b.log"]).log_files, ["a.log", "b.log"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(["-", "a.log"])
 
     def test_no_lookup_reads_cache_file(self):
         with tempfile.TemporaryDirectory() as tmp:

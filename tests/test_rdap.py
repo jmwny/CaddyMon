@@ -10,6 +10,7 @@ import ipaddress as ipa
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from email.utils import formatdate
@@ -68,6 +69,19 @@ class HelperTests(unittest.TestCase):
         lim.backoff("b", 7)
         self.assertTrue(6.9 < lim.delay("b") <= 7)
         self.assertEqual(lim.delay("idle"), 0)
+
+    def test_delay_waits_for_the_lock(self):
+        # _fetch_json calls delay() while other workers' acquire() may be
+        # changing the same send-time deque; reading it unlocked could raise
+        # "deque mutated during iteration". So delay() must take the lock.
+        lim = RateLimiter({}, [(10, 10)])
+        lim.acquire("a")
+        done = threading.Event()
+        with lim._lock:
+            threading.Thread(target=lambda: (lim.delay("a"), done.set()),
+                             daemon=True).start()
+            self.assertFalse(done.wait(0.2))  # blocked while the lock is held
+        self.assertTrue(done.wait(5))
 
     def test_rdap_names_are_cleaned(self):
         entity = {"vcardArray": ["vcard", [["fn", {}, "text", "Evil\x1b[2J Corp"]]]}
@@ -340,6 +354,36 @@ class CacheIntegrationTests(OfflineTestCase):
         r._retry_at["1.2.3.4"] = 0.0
         r.forget(["1.2.3.4"])
         self.assertFalse("1.2.3.4" in r._cache or "1.2.3.4" in r._wanted or "1.2.3.4" in r._retry_at)
+
+    def test_lookups_off_answers_are_memoised(self):
+        # lookup() runs for every visible IP on every frame; with lookups off
+        # the answer can't change, so the range search runs once per IP.
+        ranges = RangeCache()
+        ranges.put([ipa.ip_network("203.0.5.0/24")], "Cached (ZZ)")
+        r = OwnerResolver(enabled=False, ranges=ranges)
+        with mock.patch.object(ranges, "get", wraps=ranges.get) as get:
+            for _ in range(50):
+                self.assertEqual(r.lookup("203.0.5.9"), "Cached (ZZ)")
+        self.assertEqual(get.call_count, 1)
+        r.forget(["203.0.5.9"])
+        self.assertNotIn("203.0.5.9", r._cache)
+
+    def test_pending_guess_is_memoised_until_the_ranges_change(self):
+        ranges = RangeCache()
+        r = OwnerResolver(enabled=True, ranges=ranges)
+        with mock.patch.object(r, "_start_workers"), \
+                mock.patch.object(ranges, "get", wraps=ranges.get) as get:
+            for _ in range(50):
+                self.assertIsNone(r.lookup("203.0.5.9"))  # pending, nothing known
+            self.assertEqual(get.call_count, 1)
+            # A sibling's answer covers this block: shown on the next frame.
+            ranges.put([ipa.ip_network("203.0.5.0/24")], "Sibling (ZZ)")
+            for _ in range(50):
+                self.assertEqual(r.lookup("203.0.5.9"), "Sibling (ZZ)")
+            self.assertEqual(get.call_count, 2)
+        r._cache["203.0.5.9"] = "Final (ZZ)"  # the worker's own answer
+        self.assertEqual(r.lookup("203.0.5.9"), "Final (ZZ)")
+        self.assertNotIn("203.0.5.9", r._provisional)
 
 
 if __name__ == "__main__":

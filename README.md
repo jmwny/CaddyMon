@@ -1,6 +1,6 @@
 # Caddy Traffic Monitor
 
-A live, htop-style terminal view of a [Caddy](https://caddyserver.com/) JSON access log. Requests are grouped by client IP, so a scanner hammering your server shows up as one line with a running count instead of hundreds of rows. Each IP line also shows who owns the address.
+A live, htop-style terminal view of [Caddy](https://caddyserver.com/) JSON access logs: one log, or one per site, all at once. Requests are grouped by client IP, so a scanner hammering your server shows up as one line with a running count instead of hundreds of rows. Each IP line also shows who owns the address.
 
 ```
  CADDY MONITOR  access.log  up 1h12m │ 1,284 req  4.1/s  ▁▂▁▃▇▅▂▁▁▂▃▁▁▂▁ │ 2xx 212  3xx 18  4xx 1,049  5xx 5
@@ -19,12 +19,12 @@ A live, htop-style terminal view of a [Caddy](https://caddyserver.com/) JSON acc
  ↑↓ select   ←→ pane   ⏎ follow IP   esc all IPs   tab layout   a/2-5 filter   s sort   q quit
 ```
 
-It's plain Python with no dependencies: a small entry script plus the `caddymon/` package next to it. It follows the log natively and keeps going when Caddy rotates the file.
+It's plain Python with no dependencies: a small entry script plus the `caddymon/` package next to it. It follows the logs natively and keeps going when Caddy rotates them.
 
 ## Requirements
 
 - Python 3.7 or newer. Standard library only; nothing to install. Copy `caddy_traffic_monitor.py` and the `caddymon/` folder together; the `tests/` folder is optional.
-- Read access to the Caddy log, so usually `sudo`.
+- Read access to the Caddy logs, so usually `sudo`.
 - Caddy writing JSON access logs, for example:
 
   ```caddyfile
@@ -39,10 +39,10 @@ It's plain Python with no dependencies: a small entry script plus the `caddymon/
 ## Usage
 
 ```bash
-sudo python3 caddy_traffic_monitor.py [LOG_FILE] [options]
+sudo python3 caddy_traffic_monitor.py [LOG_FILE ...] [options]
 ```
 
-The default log path is `/var/log/caddy/denied_access.log`. Pass a different path as the argument or set `CADDY_LOG_FILE`. Quit with `q` or Ctrl+C, and a summary is printed on exit.
+The default log path is `/var/log/caddy/denied_access.log`. Pass one or more different paths as arguments, or set `CADDY_LOG_FILE` (several paths separated by `:`). Quit with `q` or Ctrl+C, and a summary is printed on exit.
 
 ```bash
 # Watch the default log
@@ -50,6 +50,10 @@ sudo python3 caddy_traffic_monitor.py
 
 # Watch a specific log
 sudo python3 caddy_traffic_monitor.py /var/log/caddy/access.log
+
+# Watch several sites' logs at once
+sudo python3 caddy_traffic_monitor.py /var/log/caddy/www.example.com.log /var/log/caddy/shop.example.com.log
+sudo python3 caddy_traffic_monitor.py /var/log/caddy/*.log
 
 # Load the whole file first, then keep following, IPs only
 sudo python3 caddy_traffic_monitor.py /var/log/caddy/access.log --from-start --layout ips
@@ -62,12 +66,12 @@ python3 caddy_traffic_monitor.py - < access.log.1
 
 | Area | What it shows |
 |---|---|
-| **Header** | Total requests, request rate over the last 60 seconds with a sparkline, counts per status class, uptime. Less important parts drop off on narrow terminals. |
+| **Header** | The log's file name (or the number of sites), total requests, request rate over the last 60 seconds with a sparkline, counts per status class, uptime. Less important parts drop off on narrow terminals, the sparkline first and the log name last. |
 | **IP pane** | One entry per client IP: hits, a count for each status class (`·` means zero), when it was last seen, and the owner on the line below. |
 | **Request pane** | The newest requests, from all IPs or only the IP you're following. Scroll back through the last 5,000 requests. |
 | **Footer** | The keys that work right now. |
 
-`⚠` marks a likely scanner: an IP with at least 10 client errors (4xx) and no successful (2xx) responses. Change the threshold with `--suspect N`; 0 turns the flag off.
+`⚠` marks a likely scanner: an IP with at least 10 client errors (4xx) and no successful (2xx) responses. Change the threshold with `--suspect N`; 0 turns the flag off. With several logs, an IP is also flagged once it has client errors and no successful responses on 2 or more of your sites, the pattern of a scanner probing every host you serve. Change that with `--suspect-sites M`; 0 turns it off.
 
 ### Keys
 
@@ -80,10 +84,22 @@ python3 caddy_traffic_monitor.py - < access.log.1
 | `Tab` / `g` | Cycle the layout: split → IPs only → requests only |
 | `2` `3` `4` `5` | Show only that status class (both panes) |
 | `a` / `0` | Show all status classes |
+| `f` | With several logs: show one site at a time (all sites → each site → all sites) |
 | `s` | Sort IPs by most recent or by most hits |
 | `q` | Quit and print the summary |
 
 The cursor stays on the same IP even when the list reorders. In the requests-only layout the arrow keys always scroll the requests. While you're scrolled back, the request pane title says `paused` and shows your position, and new requests don't move the view. `End` jumps back to the newest requests, and so does changing the filter or the followed IP. The screen needs at least 64×12 characters and redraws itself when the window is resized.
+
+### Several sites
+
+If Caddy writes one log per site, give the tool all of them. Each site is named after its log file, minus `.log`, so `www.example.com.log` becomes `www.example.com`. If two files have the same name in different folders, the folder is added in front.
+
+- The header shows how many sites you're watching, and the request pane gets a site column.
+- An IP that has visited more than one of your sites is marked `N sites`, and can earn a `⚠` (see above).
+- `f` narrows everything to one site: the header's totals and rate, the IP pane's counts, and the request pane. Press it again for the next site, and after the last one you're back to all sites.
+- The exit summary adds a "Per site" section.
+
+Caddy names rotated copies like `www.example.com-2026-10-01T12-00-00.000.log`, so a `*.log` wildcard picks them up too. The tool skips them, with a note, because they never change. With `--from-start` it reads them, so you can still replay an old log.
 
 ## Who owns an IP?
 
@@ -129,19 +145,18 @@ Registry answers are saved to `rdap_cache.json`, in the same folder as the scrip
 
 | Option | Default | Description |
 |---|---|---|
-| `LOG_FILE` | `/var/log/caddy/denied_access.log` | Log to follow (or `CADDY_LOG_FILE`). `-` reads stdin. |
+| `LOG_FILE ...` | `/var/log/caddy/denied_access.log` | Logs to follow, one or more (or `CADDY_LOG_FILE`, `:`-separated). `-` on its own reads stdin. |
 | `--from-start` | off | Read the existing file first instead of only new lines. |
 | `--layout {split,ips,stream}` | `split` | Starting layout. `-g`/`--group` is short for `--layout ips`. |
 | `--suspect N` | `10` | 4xx count (with no 2xx) that earns the `⚠` flag; 0 disables. |
+| `--suspect-sites M` | `2` | With several logs, the number of sites with 4xx and no 2xx that earns the `⚠` flag; 0 disables. |
 | `--no-lookup` | off | Don't look up IP owners over the network. Owners already in the cache still show. |
 | `--cache PATH` | `rdap_cache.json` next to the script | Where registry answers are kept between runs. |
 | `--no-cache` | off | Don't read or write the cache file. |
 | `--no-color` | off | Disable colors. They also turn off automatically when output isn't a terminal. |
 | `--poll SECONDS` | `0.5` | How often to check an idle log for new data. Must be a positive number. |
 
-`-n`/`--summary-every` is still accepted so old command lines keep working, but it's hidden and does nothing. The `SUMMARY_EVERY` environment variable is ignored.
-
-If the log file doesn't exist at startup, the tool exits with an error, with or without `--from-start`. If it disappears later, for example during log rotation, the tool waits for it to come back and stays responsive meanwhile.
+If any log file doesn't exist at startup, the tool exits with an error, with or without `--from-start`. If one disappears later, for example during log rotation, the tool waits for it to come back and stays responsive meanwhile.
 
 ## Piped output and the exit summary
 
@@ -151,7 +166,9 @@ When output isn't a terminal (piped to `grep`, redirected to a file, run under s
   2026-09-26 14:02:11 ✗ 404   GET    45.148.10.23    /.env
 ```
 
-Whichever mode you use, quitting prints a summary: totals per status class, top IPs with their owners, top denied (403) IPs and top paths:
+With several logs, each line also names the site.
+
+Whichever mode you use, quitting prints a summary: totals per status class (and per site, with several logs), top IPs with their owners, top denied (403) IPs and top paths:
 
 ```
   ──────────────── SUMMARY (1284 requests) ────────────────
@@ -180,7 +197,7 @@ The code is split by concern: log reading (`caddymon/logsource.py`), stats (`sta
 python -m unittest discover -s tests
 ```
 
-They take about 15 seconds and never touch the network: the registries, IANA's tables and DNS are all faked locally. `python -m caddymon` works the same as the entry script.
+They take about 20 seconds and never touch the network: the registries, IANA's tables and DNS are all faked locally. `python -m caddymon` works the same as the entry script.
 
 ## Platform notes
 

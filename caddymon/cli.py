@@ -8,11 +8,13 @@ import select
 import signal
 import sys
 
-from .logsource import Record, follow, iter_stdin, parse_line
+from .logsource import (Record, follow_many, is_rotated, iter_stdin, parse_line,
+                        site_labels)
 from .output import Display, Palette, render_row
 from .rdap import OwnerResolver, RangeCache
 from .screen import Screen
 from .stats import Stats
+from .text import clean
 
 
 # Raw single-key input is POSIX-only (termios/tty). When unavailable (e.g. on
@@ -45,19 +47,18 @@ def _positive_float(value: str) -> float:
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Live color-coded view of a Caddy JSON access log.",
+        description="Live color-coded view of Caddy JSON access logs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    env_logs = os.environ.get("CADDY_LOG_FILE", "")
     parser.add_argument(
-        "log_file",
-        nargs="?",
-        default=os.environ.get("CADDY_LOG_FILE", DEFAULT_LOG),
-        help="Path to the Caddy JSON access log (use '-' for stdin).",
+        "log_files",
+        nargs="*",
+        metavar="LOG_FILE",
+        default=[p for p in env_logs.split(os.pathsep) if p] or [DEFAULT_LOG],
+        help="Caddy JSON access log(s) to follow, e.g. one per site (use '-' "
+        f"for stdin). CADDY_LOG_FILE may list several, separated by '{os.pathsep}'.",
     )
-    # Obsolete (the live header replaced periodic summaries): still accepted so
-    # old command lines work, but hidden and never parsed. The old
-    # SUMMARY_EVERY environment variable is ignored too.
-    parser.add_argument("-n", "--summary-every", help=argparse.SUPPRESS)
     parser.add_argument(
         "--from-start",
         action="store_true",
@@ -90,6 +91,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(0 disables).",
     )
     parser.add_argument(
+        "--suspect-sites",
+        type=int,
+        default=2,
+        metavar="M",
+        help="With several logs, also flag an IP with ⚠ once it has 4xx "
+        "responses and no 2xx on M+ different sites (0 disables).",
+    )
+    parser.add_argument(
         "--no-lookup",
         action="store_true",
         help="Don't look up IP owners (no RDAP or reverse-DNS queries); owners "
@@ -112,22 +121,34 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=0.5,
         help="Seconds to wait between checks when the log has no new data.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # The same log named twice (or via different spellings) would count twice.
+    seen = set()
+    unique = []
+    for path in args.log_files:
+        key = path if path == "-" else os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    args.log_files = unique
+    if "-" in unique and len(unique) > 1:
+        parser.error("'-' (stdin) can't be combined with log files")
+    return args
 
 
-def main(argv=None) -> int:
-    # Force line buffering on stdout. When stdout isn't a TTY (piped to grep/
-    # tee/less, redirected to a file, or run under systemd/nohup), CPython
-    # block-buffers it (~8 KB), so rows pile up unflushed and the stream looks
-    # frozen until the buffer fills. Line buffering flushes on every newline,
-    # which is exactly one completed row.
-    #
-    # Also force UTF-8. A redirected stdout uses the locale encoding (cp1252 on
-    # Windows), which can't encode the box-drawing/marker glyphs and would raise
-    # UnicodeEncodeError on the first header line. Likewise decode stdin (the
-    # "-" replay source) as UTF-8 with replacement, matching follow(): Caddy
-    # writes UTF-8, and cp1252 has undecodable bytes that would crash the loop.
-    # Done before argument parsing so --help/usage errors are covered too.
+def _setup_stdio() -> None:
+    """Force line buffering on stdout. When stdout isn't a TTY (piped to grep/
+    tee/less, redirected to a file, or run under systemd/nohup), CPython
+    block-buffers it (~8 KB), so rows pile up unflushed and the stream looks
+    frozen until the buffer fills. Line buffering flushes on every newline,
+    which is exactly one completed row.
+
+    Also force UTF-8. A redirected stdout uses the locale encoding (cp1252 on
+    Windows), which can't encode the box-drawing/marker glyphs and would raise
+    UnicodeEncodeError on the first header line. Likewise decode stdin (the
+    "-" replay source) as UTF-8 with replacement, matching Follower: Caddy
+    writes UTF-8, and cp1252 has undecodable bytes that would crash the loop.
+    Called before argument parsing so --help/usage errors are covered too."""
     try:
         sys.stdout.reconfigure(
             line_buffering=True, encoding="utf-8", errors="replace"
@@ -136,23 +157,57 @@ def main(argv=None) -> int:
     except (AttributeError, ValueError):
         pass
 
-    args = parse_args(argv)  # after the reconfigure: --help prints UTF-8 too
 
-    use_stdin = args.log_file == "-"
+def resolve_logs(paths: list, from_start: bool, palette: Palette) -> list | None:
+    """The logs to follow: ``paths`` minus rotated-away copies when tailing
+    (with a note on stderr). None, after an error on stderr, when only
+    rotated copies were given or a log is missing. ``["-"]`` (stdin) passes
+    through. Paths in messages are ``clean()``ed: a wildcard can pick up any
+    file name."""
+    if paths == ["-"]:
+        return paths
+    if not from_start:
+        # A rotated-away copy (e.g. picked up by a *.log wildcard) never grows,
+        # so tailing it shows nothing; --from-start can still replay one.
+        rotated = [p for p in paths if is_rotated(p)]
+        if rotated:
+            paths = [p for p in paths if not is_rotated(p)]
+            names = clean(", ".join(os.path.basename(p) for p in rotated))
+            if not paths:
+                print(f"{palette.RED}Error: only rotated logs given ({names}); "
+                      f"use --from-start to replay them{palette.RESET}", file=sys.stderr)
+                return None
+            print(f"Note: skipping {len(rotated)} rotated log(s): {names}",
+                  file=sys.stderr)
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        # Fail fast when a log is missing at startup, with or without
+        # --from-start: a typo'd path shouldn't hang silently. (A file that
+        # vanishes later, mid-rotation, is waited for by Follower.)
+        for path in missing:
+            print(f"{palette.RED}Error: Log file not found at {clean(path)}"
+                  f"{palette.RESET}", file=sys.stderr)
+        return None
+    return paths
+
+
+def main(argv=None) -> int:
+    _setup_stdio()
+    args = parse_args(argv)  # after _setup_stdio: --help prints UTF-8 too
+
     color = not args.no_color and sys.stdout.isatty()
     palette = Palette(color)
-    display = Display(palette, "stdin" if use_stdin else args.log_file)
-    if not use_stdin and not os.path.exists(args.log_file):
-        # Fail fast when the log is missing at startup, with or without
-        # --from-start: a typo'd path shouldn't hang silently. (A file that
-        # vanishes later, mid-rotation, is waited for by follow().)
-        print(
-            f"{palette.RED}Error: Log file not found at {args.log_file}{palette.RESET}",
-            file=sys.stderr,
-        )
+    paths = resolve_logs(args.log_files, args.from_start, palette)
+    if paths is None:
         return 1
+    use_stdin = paths == ["-"]
+    labels = {} if use_stdin else site_labels(paths)
+    # Paths are outside text too (a wildcard can pick up any file name), so
+    # what's shown of them is cleaned like log fields; labels already are.
+    display = Display(palette, "stdin" if use_stdin else clean(", ".join(paths)),
+                      sites=list(labels.values()))
 
-    stats = Stats()
+    stats = Stats(per_site=len(display.sites) > 1)
     ranges = RangeCache(None if args.no_cache else args.cache)
     ranges.load()
     resolver = OwnerResolver(enabled=not args.no_lookup, ranges=ranges)
@@ -175,7 +230,8 @@ def main(argv=None) -> int:
     screen = (
         Screen(palette, stats, resolver, display.log_path,
                layout="ips" if args.group else args.layout,
-               suspect=args.suspect, keys=kbd_enabled)
+               suspect=args.suspect, suspect_sites=args.suspect_sites,
+               keys=kbd_enabled, sites=display.sites)
         if interactive
         else None
     )
@@ -186,7 +242,7 @@ def main(argv=None) -> int:
         if screen is not None:
             screen.add(rec)  # drawn on the next frame
         else:
-            sys.stdout.write(render_row(palette, rec) + "\n")
+            sys.stdout.write(render_row(palette, rec, display.site_w) + "\n")
 
     def drain_keys(fd: int) -> None:
         """Apply all keypresses currently buffered (non-blocking)."""
@@ -222,9 +278,10 @@ def main(argv=None) -> int:
                 if rec is not None:
                     emit(rec)
         else:
-            for line in follow(args.log_file, args.from_start, args.poll, fd):
-                if line is not None:
-                    rec = parse_line(line)
+            for item in follow_many(paths, args.from_start, args.poll, fd):
+                if item is not None:
+                    path, line = item
+                    rec = parse_line(line, labels[path])
                     if rec is not None:
                         emit(rec)
                 elif screen is not None:

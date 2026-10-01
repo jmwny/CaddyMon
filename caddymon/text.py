@@ -1,5 +1,6 @@
 """Terminal-safe text helpers: neutralising control characters in text from
-outside the program, and measuring/clipping ANSI-styled strings."""
+outside the program, shortening plain text to a width, and measuring/clipping
+ANSI-styled strings. Every cut is marked the same way, with "…"."""
 
 from __future__ import annotations
 
@@ -15,6 +16,19 @@ def clean(text: str) -> str:
     can't send escape sequences to the terminal (retitle it, write the
     clipboard via OSC 52, move the cursor) or throw off width math."""
     return _CONTROL_RE.sub("?", text)
+
+
+def shorten(text: str, width: int) -> str:
+    """Plain ``text`` cut to at most ``width`` characters, the cut marked
+    with "…". (For styled text, use ``clip()``.)"""
+    if width <= 0:
+        return ""
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def fit(text: str, width: int) -> str:
+    """Plain ``text`` padded or cut to exactly ``width`` characters: a column."""
+    return f"{shorten(text, width):<{width}}"
 
 
 _ANSI_RE = re.compile(r"(\x1b\[[0-9;?]*[A-Za-z])")

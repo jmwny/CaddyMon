@@ -9,11 +9,11 @@ import unittest
 from unittest import mock
 
 from caddymon.logsource import Record
-from caddymon.output import Palette
+from caddymon.output import Palette, site_width
 from caddymon.rdap import OwnerResolver
 from caddymon.screen import RateMeter, Screen, fmt_duration, parse_keys
 from caddymon.stats import Stats
-from caddymon.text import clip, vlen
+from caddymon.text import clip, fit, shorten, vlen
 
 from helpers import Term
 
@@ -33,6 +33,16 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(vlen(clip(s, 7, p.RESET)), 7)
         self.assertEqual(clip("abc", 5), "abc")
         self.assertEqual(clip("abcdef", 0), "")
+
+    def test_shorten_and_fit_mark_cuts_the_same_way(self):
+        self.assertEqual(shorten("abcdef", 4), "abc…")
+        self.assertEqual(shorten("abc", 4), "abc")
+        self.assertEqual(shorten("abc", 0), "")
+        self.assertEqual(fit("abc", 5), "abc  ")
+        self.assertEqual(fit("abcdef", 5), "abcd…")
+        self.assertEqual(site_width(["www.example.com", "a"]), 15)
+        self.assertEqual(site_width(["x" * 40]), 24)  # capped
+        self.assertEqual(site_width([]), 0)
 
     def test_fmt_duration(self):
         self.assertEqual([fmt_duration(s) for s in (59, 61, 4320)], ["59s", "1m01s", "1h12m"])
@@ -94,6 +104,113 @@ class ScreenTests(unittest.TestCase):
         self.assertIn("└─ private network", text)
         self.assertIn("· 101  GET    10.9.9.9", text)  # 1xx: dim · marker
         self.assertIn("q quit", lines[-1])
+
+    def test_header_keeps_log_name_over_sparkline(self):
+        for cols in (100, 80, 64):
+            with self.subTest(cols=cols):
+                screen = self.make(cols=cols)
+                screen.log_path = "/var/log/caddy/www.example.com.log"
+                self.traffic()
+                self.render()
+                header = self.term.lines()[0]
+                self.assertIn("www.example.com.log", header)
+                self.assertNotIn("▁", header)  # sparkline gave way first
+                self.assertNotIn("\033[2mwww.example.com.log", self.screen._header(cols - 1))
+
+    def test_several_logs_add_a_site_column(self):
+        self.make(layout="stream", sites=["www.example.com", "shop.example.com"])
+        for site in ("www.example.com", "shop.example.com"):
+            rec = Record("2026-09-26 14:02:11", 404, "GET", "45.148.10.23", "/.env", site)
+            self.stats.record(rec)
+            self.screen.add(rec)
+        self.render()
+        lines = self.term.lines()
+        self.assertIn("2 sites", lines[0])
+        self.assertTrue(any("GET    www.example.com  45.148.10.23" in l for l in lines))
+        self.assertTrue(any("GET    shop.example.com 45.148.10.23" in l for l in lines))
+
+    def site_traffic(self):
+        self.make(sites=["www.example.com", "shop.example.com"])
+        self.stats.per_site = True
+        for site, ip, status in [("www.example.com", "45.148.10.23", 404)] * 3 + [
+                ("shop.example.com", "45.148.10.23", 200),
+                ("www.example.com", "66.249.66.1", 301)]:
+            rec = Record("2026-09-26 14:02:11", status, "GET", ip, "/" + site, site)
+            self.stats.record(rec)
+            self.screen.add(rec)
+
+    def test_site_filter_narrows_everything_to_one_site(self):
+        self.site_traffic()
+        text = self.render()
+        self.assertIn("2 sites", self.term.lines()[0])
+        self.assertIn("f site", self.term.lines()[-1])
+        scanner = next(l for l in self.term.lines() if l.startswith("  45.148.10.23"))
+        self.assertIn("2 sites", scanner)  # hit both sites
+        self.assertNotIn("2 sites", next(l for l in self.term.lines() if "66.249.66.1" in l))
+
+        self.screen.handle_input("ff")  # all -> www -> shop
+        self.assertEqual(self.screen.site, "shop.example.com")
+        text = self.render()
+        lines = self.term.lines()
+        self.assertIn("shop.example.com (2 of 2)", lines[0])
+        self.assertIn("1 req", lines[0])  # the header counts this site only
+        self.assertIn("IPs 1 · by recent · all codes · shop.example.com", text)
+        scanner = next(l for l in lines if l.startswith("  45.148.10.23"))
+        self.assertRegex(scanner, r"45\.148\.10\.23\s+1\s+1\s+·\s+·\s+·")  # its shop hits
+        self.assertIn("2 sites", scanner)  # still counted across all sites
+        self.assertNotIn("66.249.66.1", text)  # never hit the shop
+        self.assertIn("Requests · all IPs · all codes · shop.example.com", text)
+        self.assertIn("GET    45.148.10.23", text)  # no site column while narrowed
+        self.assertNotIn("/www.example.com", text)
+
+        self.screen.handle_input("f")  # back to all sites
+        self.assertIsNone(self.screen.site)
+        self.assertIn("2 sites", self.render().splitlines()[0])
+
+    def test_errors_on_several_sites_flag_an_ip(self):
+        sites = ["a.example.com", "b.example.com", "c.example.com"]
+        for suspect_sites, flagged in ((2, {"6.6.6.6"}), (3, set()), (0, set())):
+            with self.subTest(suspect_sites=suspect_sites):
+                self.make(sites=sites, suspect_sites=suspect_sites)
+                self.stats.per_site = True
+                for ip, site, status in [
+                        ("6.6.6.6", "a.example.com", 404),  # errors only, on 2 sites
+                        ("6.6.6.6", "b.example.com", 404),
+                        ("7.7.7.7", "a.example.com", 404),  # a 2xx on one of its 2 sites
+                        ("7.7.7.7", "b.example.com", 404),
+                        ("7.7.7.7", "b.example.com", 200),
+                        ("8.8.8.8", "c.example.com", 404)]:  # one site only
+                    rec = Record("2026-09-26 14:02:11", status, "GET", ip, "/", site)
+                    self.stats.record(rec)
+                    self.screen.add(rec)
+                self.render()
+                rows = {l.split()[0]: l for l in self.term.lines() if l.startswith("  ")
+                        and l.split()[0] in ("6.6.6.6", "7.7.7.7", "8.8.8.8")}
+                self.assertEqual({ip for ip, l in rows.items() if "⚠" in l}, flagged)
+        # Filtered to one site, the cross-site part still counts every site.
+        self.make(sites=sites)
+        self.stats.per_site = True
+        for site in ("a.example.com", "b.example.com"):
+            rec = Record("2026-09-26 14:02:11", 404, "GET", "6.6.6.6", "/", site)
+            self.stats.record(rec)
+            self.screen.add(rec)
+        self.screen.handle_input("f")
+        self.render()
+        self.assertIn("⚠", next(l for l in self.term.lines() if l.startswith("  6.6.6.6")))
+
+    def test_site_key_needs_several_logs(self):
+        self.make(sites=["access"])
+        self.screen.handle_input("f")
+        self.assertIsNone(self.screen.site)
+        self.render()
+        self.assertNotIn("f site", self.term.lines()[-1])
+
+    def test_one_log_has_no_site_column(self):
+        self.make(layout="stream", sites=["access"])
+        self.feed("45.148.10.23", 404, "/.env")
+        self.render()
+        self.assertIn("access.log", self.term.lines()[0])
+        self.assertTrue(any("GET    45.148.10.23" in l for l in self.term.lines()))
 
     def test_follow_filter_sort_and_escape(self):
         self.make()

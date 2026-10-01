@@ -1,4 +1,5 @@
-"""Status classification and running totals (overall, per IP, per path)."""
+"""Status classification and running totals (overall, per IP, per path, and
+per site when following several logs)."""
 
 from __future__ import annotations
 
@@ -46,12 +47,21 @@ def marker(status: int) -> str:
 
 @dataclass
 class IpStat:
-    """Per-IP running totals for the grouped view and the summary."""
+    """Per-IP running totals for the grouped view and the summary. With
+    ``Stats.per_site``, ``sites`` holds the same totals split by site (site ->
+    IpStat, whose own ``sites`` stays empty)."""
 
     hits: int = 0
     classes: Counter = field(default_factory=Counter)
     last_time: str = ""
     last_seq: int = 0  # Stats.total at the last hit; orders "most recent"
+    sites: dict = field(default_factory=dict)
+
+    def add(self, cls: str, when: str, seq: int) -> None:
+        self.hits += 1
+        self.classes[cls] += 1
+        self.last_time = when
+        self.last_seq = seq
 
 
 @dataclass
@@ -62,7 +72,11 @@ class Stats:
     bounded: past ``MAX_*`` keys, a table is cut back to half, keeping the
     biggest counts (and, for IPs, also the most recently seen). Long-tail counts
     are therefore approximate on very long runs. ``on_evict`` is called with
-    the IPs dropped, so the resolver can forget them too."""
+    the IPs dropped, so the resolver can forget them too.
+
+    ``per_site`` (set when following several logs) also splits the totals by
+    ``Record.site``: ``sites`` (site -> class Counter, exact) and each IP's
+    ``IpStat.sites``. Off, nothing per-site is kept."""
 
     MAX_IPS = 20000
     MAX_PATHS = 5000
@@ -74,11 +88,15 @@ class Stats:
     paths: Counter = field(default_factory=Counter)
     ips: dict = field(default_factory=dict)  # ip -> IpStat
     on_evict: object = None  # callable(list_of_ips) or None
+    per_site: bool = False
+    sites: dict = field(default_factory=dict)  # site -> Counter (per_site only)
 
     def record(self, rec: Record) -> None:
         self.total += 1
         cls = classify(rec.status)
         self.classes[cls] += 1
+        if self.per_site:
+            self.sites.setdefault(rec.site, Counter())[cls] += 1
         if rec.status == 403:
             self.denied_ips[rec.ip] += 1
             if len(self.denied_ips) > self.MAX_DENIED:
@@ -92,10 +110,12 @@ class Stats:
             if len(self.ips) >= self.MAX_IPS:
                 self._prune_ips()  # before inserting, so the new IP survives
             st = self.ips[rec.ip] = IpStat()
-        st.hits += 1
-        st.classes[cls] += 1
-        st.last_time = rec.time
-        st.last_seq = self.total
+        st.add(cls, rec.time, self.total)
+        if self.per_site:
+            site = st.sites.get(rec.site)
+            if site is None:
+                site = st.sites[rec.site] = IpStat()
+            site.add(cls, rec.time, self.total)
 
     def _prune_ips(self) -> None:
         # A quarter by hits plus a quarter by recency: at most half survives,

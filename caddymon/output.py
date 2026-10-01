@@ -9,9 +9,12 @@ from datetime import datetime
 from .logsource import Record
 from .rdap import OwnerResolver
 from .stats import CLASS_STYLE, CLASSES, Stats, classify, marker
+from .text import fit, shorten
 
 
-URI_MAX = 40
+URI_MAX = 40  # plain request rows
+PATH_MAX = 50  # the summary's "Top paths"
+SITE_COL_MAX = 24  # widest site column before labels are cut
 
 
 class Palette:
@@ -38,14 +41,22 @@ class Palette:
         return getattr(self, CLASS_STYLE[classify(status)])
 
 
-def render_row(p: Palette, rec: Record) -> str:
-    """Return the formatted request row (no trailing newline)."""
+def site_width(labels) -> int:
+    """Width of a site column for these labels (0 for none), capped at
+    ``SITE_COL_MAX``; longer labels are cut by ``fit()``."""
+    return min(max(map(len, labels), default=0), SITE_COL_MAX)
+
+
+def render_row(p: Palette, rec: Record, site_w: int = 0) -> str:
+    """Return the formatted request row (no trailing newline). ``site_w`` > 0
+    adds a site column that wide (when following several logs)."""
     color = p.style_for(rec.status)
-    uri = rec.uri if len(rec.uri) <= URI_MAX else rec.uri[: URI_MAX - 2] + ".."
+    uri = shorten(rec.uri, URI_MAX)
+    site = f"{fit(rec.site, site_w)} " if site_w else ""
     return (
         f"  {p.DIM}{rec.time:<19}{p.RESET} "
         f"{color}{marker(rec.status)} {rec.status:<5}{p.RESET} "
-        f"{p.WHITE}{rec.method:<6}{p.RESET} "
+        f"{p.WHITE}{rec.method:<6}{p.RESET} {site}"
         f"{p.CYAN}{rec.ip:<15}{p.RESET} "
         f"{p.DIM}{uri}{p.RESET}"
     )
@@ -64,9 +75,12 @@ class Display:
     """Plain (non-interactive) output: a one-shot header and the exit summary.
     The interactive layout lives in ``Screen``."""
 
-    def __init__(self, p: Palette, log_path: str):
+    def __init__(self, p: Palette, log_path: str, sites: list | None = None):
         self.p = p
-        self.log_path = log_path
+        self.log_path = log_path  # what the header shows on its "Log:" line
+        self.sites = list(sites or [])  # labels, when following several logs
+        # 0: no site column (one log, or stdin)
+        self.site_w = site_width(self.sites) if len(self.sites) > 1 else 0
 
     def header(self) -> None:
         p = self.p
@@ -77,7 +91,7 @@ class Display:
         print("  ║              📡  CADDY TRAFFIC MONITOR  📡               ║")
         print("  ╚══════════════════════════════════════════════════════════╝")
         print(p.RESET)
-        print(f"  {p.DIM}Log: {self.log_path}{p.RESET}")
+        print(f"  {p.DIM}{'Logs' if self.site_w else 'Log'}: {self.log_path}{p.RESET}")
         started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"  {p.DIM}Started: {started}   |   Press Ctrl+C to exit{p.RESET}")
         print()
@@ -86,12 +100,14 @@ class Display:
             f"{p.CYAN}■ 3xx Redirect{p.RESET}  {p.YELLOW}■ 4xx Client Err{p.RESET}  "
             f"{p.BRIGHT_RED}■ 5xx Server Err{p.RESET}"
         )
-        print(f"  {p.BOLD}{p.WHITE}{'─' * 68}{p.RESET}")
+        rule = "─" * (68 + (self.site_w + 1 if self.site_w else 0))
+        site = f"{'SITE':<{self.site_w}} " if self.site_w else ""
+        print(f"  {p.BOLD}{p.WHITE}{rule}{p.RESET}")
         print(
-            f"  {p.BOLD}{'TIME':<19} {'STATUS':<7} {'METHOD':<6} "
+            f"  {p.BOLD}{'TIME':<19} {'STATUS':<7} {'METHOD':<6} {site}"
             f"{'IP ADDRESS':<15} URI{p.RESET}"
         )
-        print(f"  {p.BOLD}{p.WHITE}{'─' * 68}{p.RESET}")
+        print(f"  {p.BOLD}{p.WHITE}{rule}{p.RESET}")
 
     def summary(self, stats: Stats, resolver: OwnerResolver) -> None:
         p = self.p
@@ -123,6 +139,15 @@ class Display:
             color = getattr(p, attr)
             print(f"  {color}{label:<15} {count}{p.RESET}")
 
+        if len(stats.sites) > 1:
+            print(f"  {p.DIM}── Per site ──{p.RESET}")
+            site_w = site_width(stats.sites)
+            by_size = sorted(stats.sites.items(), key=lambda kv: sum(kv[1].values()),
+                             reverse=True)
+            for site, classes in by_size:
+                print(f"  {p.YELLOW}{sum(classes.values()):<5}{p.RESET} → "
+                      f"{fit(site, site_w)} {class_breakdown(p, classes)}")
+
         if top_ips:
             print(f"  {p.DIM}── Top IPs ──{p.RESET}")
             ip_w = max(15, max(len(ip) for ip, _ in top_ips))
@@ -142,8 +167,8 @@ class Display:
         if stats.paths:
             print(f"  {p.DIM}── Top paths ──{p.RESET}")
             for path, count in stats.paths.most_common(5):
-                shown = path if len(path) <= 50 else path[:48] + ".."
-                print(f"  {p.YELLOW}{count:<5}{p.RESET} → {p.DIM}{shown}{p.RESET}")
+                print(f"  {p.YELLOW}{count:<5}{p.RESET} → "
+                      f"{p.DIM}{shorten(path, PATH_MAX)}{p.RESET}")
 
         print(f"  {p.BOLD}{p.WHITE}{'─' * 68}{p.RESET}")
         print()

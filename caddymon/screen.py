@@ -6,13 +6,13 @@ import os
 import re
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 
 from .logsource import Record
-from .output import Palette
+from .output import Palette, site_width
 from .rdap import OwnerResolver
 from .stats import CLASSES, IpStat, Stats, classify, marker
-from .text import clip, vlen
+from .text import clip, fit, vlen
 
 
 # filter key -> status class ("all" shows everything).
@@ -123,7 +123,8 @@ class Screen:
     screen:
 
     - a one-line header: file, uptime, totals, rolling rate + sparkline, and
-      per-class counts (segments drop off on narrow terminals);
+      per-class counts (segments drop off on narrow terminals, the sparkline
+      first and the file name last);
     - an *IP pane*: one entry per client IP, two lines each — stats (hits,
       per-class counts with zeros as a dim ``·``, last seen, a ``⚠`` for likely
       scanners), then the owner from ``OwnerResolver`` on a ``└─`` connector;
@@ -140,6 +141,12 @@ class Screen:
     matches bump it so a scrolled view stays put; ``end`` goes live again).
     ``enter`` follows the selected IP in the request pane, ``esc`` goes back
     to all IPs.
+
+    With several logs (``sites``), the request pane gets a site column and an
+    IP that hit more than one site is marked ``N sites``; ``f`` cycles ``site``
+    (all, then each in turn), which narrows both panes and the header to that
+    site, using its per-site counts (``IpStat.sites``, ``Stats.sites``) and its
+    own ``RateMeter``.
 
     Drawing: every frame is composed as a list of lines and only lines that
     changed since the last frame are rewritten (each ends with erase-to-EOL, so
@@ -161,8 +168,7 @@ class Screen:
     HEARTBEAT = 1.0  # max seconds between redraws (clock / rate)
     SPLIT_IPS = 0.55  # share of the body given to the IP pane in "split"
     SPARK_WIDTH = 15  # 4 s per character over the 60 s window
-    IP_COL_MIN, IP_COL_MAX = 15, 39  # dotted IPv4 .. full IPv6
-    # Visible width of an IP stats line minus the IP column:
+    IP_COL_MIN, IP_COL_MAX = 15, 39  # dotted IPv4 .. full IPv6    # Visible width of an IP stats line minus the IP column:
     # cursor(2) sp hits(6) counts(4x5) sp(2) last(8) sp(2) flag(1)
     STATS_FIXED = 2 + 1 + 6 + 4 * 5 + 2 + 8 + 2 + 1
     OWNER_INDENT = "  └─ "  # owner line: hangs off the IP above it
@@ -170,13 +176,21 @@ class Screen:
 
     def __init__(self, p: Palette, stats: Stats, resolver: OwnerResolver,
                  log_path: str, layout: str = "split", suspect: int = 10,
-                 keys: bool = True, history_size: int = 5000):
+                 keys: bool = True, history_size: int = 5000,
+                 sites: list | None = None, suspect_sites: int = 2):
         self.p = p
         self.stats = stats
         self.resolver = resolver
         self.log_path = log_path
+        self.sites = list(sites or [])  # labels, when following several logs
+        self.site = None  # site both panes are narrowed to (None = all)
+        # A rate per site too, so the header can describe the filtered site.
+        self.site_meters = ({s: RateMeter() for s in self.sites}
+                            if len(self.sites) > 1 else {})
         self.layout = layout
         self.suspect = suspect  # 4xx hits (with no 2xx) that flag an IP; 0 = off
+        # Sites with 4xx and no 2xx that flag an IP (several logs); 0 = off.
+        self.suspect_sites = suspect_sites
         self.keys = keys  # whether keyboard input works (for the footer)
         self.history: deque = deque(maxlen=history_size)  # Records
         self.meter = RateMeter()
@@ -227,6 +241,8 @@ class Screen:
         if self._req_back and self._shows(rec):
             self._req_back += 1  # scrolled back: keep the same requests in view
         self.meter.add()
+        if rec.site in self.site_meters:
+            self.site_meters[rec.site].add()
         self._dirty = True
 
     def backlog_done(self) -> None:
@@ -234,7 +250,8 @@ class Screen:
         window rather than report the backlog as a burst."""
         if not self._backlog_reset:
             self._backlog_reset = True
-            self.meter.reset()
+            for meter in [self.meter, *self.site_meters.values()]:
+                meter.reset()
 
     def service(self) -> None:
         """Apply a pending resize, or redraw if the frame is due."""
@@ -266,6 +283,12 @@ class Screen:
             self.layout = self.LAYOUTS[(i + 1) % len(self.LAYOUTS)]
         elif key in ("s", "S"):
             self.sort = "hits" if self.sort == "recent" else "recent"
+        elif key in ("f", "F"):
+            if len(self.sites) < 2:
+                return  # one log: nothing to pick between
+            order = [None, *self.sites]  # all sites, then each in turn
+            self.site = order[(order.index(self.site) + 1) % len(order)]
+            self._req_back = 0  # a different set of requests: back to live
         elif key in NAV_KEYS:
             if self._focused() == "requests":
                 self._scroll(key)
@@ -392,6 +415,11 @@ class Screen:
     def _match(self, cls: str) -> bool:
         return self.filter == "all" or cls == self.filter
 
+    def _filter_label(self) -> str:
+        """The filters for pane titles: ``all codes``, ``4xx · www.example.com``."""
+        filt = "all codes" if self.filter == "all" else self.filter
+        return filt if self.site is None else f"{filt} · {self.site}"
+
     def _rule(self, width: int, title: str, details: str = "",
               right: str = "", pane: str = "") -> str:
         """Pane divider: ``─ Title · details ─────── right ─``. In "split" the
@@ -408,12 +436,24 @@ class Screen:
 
     def _header(self, width: int) -> str:
         p = self.p
-        c = self.stats.classes
+        # The header describes what the panes show: one site's numbers while
+        # the site filter is on, everything otherwise.
+        if self.site is None:
+            c, total, meter = self.stats.classes, self.stats.total, self.meter
+            if len(self.sites) > 1:
+                name = f"{len(self.sites)} sites"
+            else:
+                name = os.path.basename(self.log_path) or self.log_path
+        else:
+            c = self.stats.sites.get(self.site, Counter())
+            total, meter = sum(c.values()), self.site_meters[self.site]
+            name = (f"{self.site} {p.DIM}({self.sites.index(self.site) + 1} "
+                    f"of {len(self.sites)}){p.RESET}")
         classes = "  ".join(
             f"{getattr(p, attr)}{key} {c.get(key, 0):,}{p.RESET}"
             for key, _label, attr in CLASSES[:4]
         )
-        bins = self.meter.bins(self.SPARK_WIDTH)
+        bins = meter.bins(self.SPARK_WIDTH)
         top = max(bins) or 1
         spark = "".join(
             f"{p.GREEN}{SPARK_CHARS[min(int(n / top * 7.999), 7)]}{p.RESET}"
@@ -422,17 +462,19 @@ class Screen:
         )
         parts = {
             "title": f"{p.BOLD}{p.WHITE}CADDY MONITOR{p.RESET}",
-            "file": f"{p.DIM}{os.path.basename(self.log_path) or self.log_path}{p.RESET}",
+            # Not dimmed: per-site Caddy logs are named after the host.
+            "file": name,
             "uptime": f"{p.DIM}up {fmt_duration(time.monotonic() - self.start_ts)}{p.RESET}",
-            "total": (f"{p.WHITE}{self.stats.total:,}{p.RESET} req  "
-                      f"{p.WHITE}{self.meter.rate():.1f}{p.RESET}/s"),
+            "total": (f"{p.WHITE}{total:,}{p.RESET} req  "
+                      f"{p.WHITE}{meter.rate():.1f}{p.RESET}/s"),
             "spark": spark,
             "classes": classes,
         }
         sep = f" {p.DIM}│{p.RESET} "
         groups = (("title", "file", "uptime"), ("total", "spark"), ("classes",))
-        # Drop the least useful segments first until the line fits.
-        for drop in ("", "file", "spark", "uptime", "title", "classes"):
+        # Drop the least useful segments first until the line fits; the log
+        # name (usually the site's hostname) outlasts everything but the total.
+        for drop in ("", "spark", "uptime", "title", "classes", "file"):
             parts.pop(drop, None)
             line = " " + sep.join(
                 "  ".join(parts[k] for k in g if k in parts)
@@ -462,8 +504,10 @@ class Screen:
             keys.append(("end", "latest", ""))  # short: the pane title says it
         if self.follow or self.selected:
             keys.append(("esc", "all IPs", ""))  # short: the pane title says it
-        keys += [("tab", "layout", "view"), ("a/2-5", "filter", "filter"),
-                 ("s", "sort", ""), ("q", "quit", "quit")]  # sort: least needed
+        keys += [("tab", "layout", "view"), ("a/2-5", "filter", "filter")]
+        if len(self.sites) > 1:
+            keys.append(("f", "site", "site"))
+        keys += [("s", "sort", ""), ("q", "quit", "quit")]  # sort: least needed
         for gap, short in (("   ", False), ("  ", False), ("  ", True)):
             line = " " + gap.join(
                 f"{p.BOLD}{k}{p.RESET} {p.DIM}{s if short else d}{p.RESET}"
@@ -478,17 +522,21 @@ class Screen:
     def _ip_entries(self) -> list:
         """(ip, IpStat) pairs: filtered by status class, sorted by most recent
         hit or by hit count (the filtered class's count when a filter is on).
+        With the site filter on, the IpStat is that site's share
+        (``IpStat.sites``), so every number in the pane is for that site.
         Memoised until a record arrives (``stats.total`` changes; that's also
-        when ``Stats`` prunes) or the filter/sort changes, so idle frames and
-        key presses don't re-sort every IP. Treat the result as read-only."""
-        memo_key = (self.stats.total, self.filter, self.sort)
+        when ``Stats`` prunes) or the filter/sort/site changes, so idle frames
+        and key presses don't re-sort every IP. Treat the result as read-only."""
+        memo_key = (self.stats.total, self.filter, self.sort, self.site)
         if memo_key == self._entries_key:
             return self._entries
-        if self.filter == "all":
+        if self.site is None:
             items = list(self.stats.ips.items())
         else:
-            items = [kv for kv in self.stats.ips.items()
-                     if kv[1].classes.get(self.filter, 0)]
+            items = [(ip, st.sites[self.site]) for ip, st in self.stats.ips.items()
+                     if self.site in st.sites]
+        if self.filter != "all":
+            items = [kv for kv in items if kv[1].classes.get(self.filter, 0)]
         if self.sort == "hits":
             if self.filter == "all":
                 key = lambda kv: (kv[1].hits, kv[1].last_seq)
@@ -500,10 +548,20 @@ class Screen:
         self._entries_key, self._entries = memo_key, items
         return items
 
-    def _is_suspect(self, st: IpStat) -> bool:
-        """Scanner pattern: lots of client errors and nothing successful."""
-        return (self.suspect > 0 and st.classes.get("4xx", 0) >= self.suspect
-                and not st.classes.get("2xx", 0))
+    def _is_suspect(self, st: IpStat, everywhere: IpStat | None = None) -> bool:
+        """Scanner pattern: lots of client errors and nothing successful in
+        ``st`` (the IP's totals, or one site's share while filtered), or, with
+        several logs, client errors and nothing successful on
+        ``suspect_sites`` or more sites (``everywhere``: the IP's full
+        IpStat, so this part ignores the site filter)."""
+        if (self.suspect > 0 and st.classes.get("4xx", 0) >= self.suspect
+                and not st.classes.get("2xx", 0)):
+            return True
+        if self.suspect_sites > 0 and everywhere is not None:
+            failing = sum(1 for site in everywhere.sites.values()
+                          if site.classes.get("4xx", 0) and not site.classes.get("2xx", 0))
+            return failing >= self.suspect_sites
+        return False
 
     def _ip_pane(self, height: int, width: int) -> list:
         p = self.p
@@ -511,20 +569,20 @@ class Screen:
         ips = [ip for ip, _ in entries]
         if self.selected is not None and self.selected not in ips:
             self.selected = None  # filtered out (or never seen)
-        fit = max((height - 2) // 2, 1)  # rule + column header, 2 lines per IP
-        self._ip_fit = fit
+        per_page = max((height - 2) // 2, 1)  # rule + column header, 2 lines per IP
+        self._ip_fit = per_page
         if self.selected is not None:  # keep the cursor on screen
             idx = ips.index(self.selected)
             if idx < self._ip_offset:
                 self._ip_offset = idx
-            elif idx >= self._ip_offset + fit:
-                self._ip_offset = idx - fit + 1
-        self._ip_offset = max(0, min(self._ip_offset, len(entries) - fit))
-        shown = entries[self._ip_offset: self._ip_offset + fit]
+            elif idx >= self._ip_offset + per_page:
+                self._ip_offset = idx - per_page + 1
+        self._ip_offset = max(0, min(self._ip_offset, len(entries) - per_page))
+        shown = entries[self._ip_offset: self._ip_offset + per_page]
 
-        filt = "all codes" if self.filter == "all" else self.filter
+        filt = self._filter_label()
         right = (f"{self._ip_offset + 1}–{self._ip_offset + len(shown)} of {len(entries)}"
-                 if len(entries) > fit else "")
+                 if len(entries) > per_page else "")
         widest = max((len(ip) for ip, _ in shown), default=0)
         w = max(self.IP_COL_MIN,
                 min(widest, self.IP_COL_MAX, width - self.STATS_FIXED))
@@ -537,7 +595,8 @@ class Screen:
         for ip, st in shown:
             lines.extend(self._ip_rows(ip, st, w, width))
         if not entries:
-            what = "requests yet" if self.filter == "all" else "matching IPs"
+            narrowed = self.filter != "all" or self.site is not None
+            what = "matching IPs" if narrowed else "requests yet"
             lines.append(f"  {p.DIM}(no {what}){p.RESET}")
         return (lines + [""] * height)[:height]
 
@@ -546,13 +605,18 @@ class Screen:
         p = self.p
         selected = ip == self.selected
         cursor = f"{p.BOLD}{p.WHITE}▶{p.RESET} " if selected else "  "
-        shown = ip if len(ip) <= w else ip[: w - 1] + "…"
         counts = "".join(
             f"{getattr(p, attr)}{st.classes[key]:>5,}{p.RESET}"
             if st.classes.get(key, 0) else f"{p.DIM}{'·':>5}{p.RESET}"
             for key, _label, attr in CLASSES[:4]
         )
-        flags = f"  {p.BRIGHT_RED}⚠{p.RESET}" if self._is_suspect(st) else ""
+        # Across all sites even while filtered: hitting several of them is
+        # what a scanner walking every host looks like.
+        everywhere = self.stats.ips.get(ip)
+        flags = (f"  {p.BRIGHT_RED}⚠{p.RESET}" if self._is_suspect(st, everywhere)
+                 else "")
+        if everywhere is not None and len(everywhere.sites) > 1:
+            flags += f"  {p.DIM}{len(everywhere.sites)} sites{p.RESET}"
         if ip == self.follow:
             flags += f"  {p.DIM}◀ following{p.RESET}"
         owner = self.resolver.lookup(ip)
@@ -563,7 +627,7 @@ class Screen:
         else:
             text = "-" if self.resolver.enabled else "(lookups off)"
         return (
-            f"{cursor}{p.BOLD if selected else ''}{p.CYAN}{shown:<{w}}{p.RESET} "
+            f"{cursor}{p.BOLD if selected else ''}{p.CYAN}{fit(ip, w)}{p.RESET} "
             f"{p.WHITE}{st.hits:>6,}{p.RESET}{counts}  "
             f"{p.DIM}{st.last_time[11:]:<8}{p.RESET}{flags}",
             f"{p.DIM}{self.OWNER_INDENT}{p.RESET}{text}",
@@ -571,9 +635,11 @@ class Screen:
 
     # ---- request pane ----
     def _shows(self, rec: Record) -> bool:
-        """Whether the request pane's filter and ``follow`` let ``rec`` in."""
-        return self._match(classify(rec.status)) and (
-            self.follow is None or rec.ip == self.follow)
+        """Whether the request pane's filters (status class, site) and
+        ``follow`` let ``rec`` in."""
+        return (self._match(classify(rec.status))
+                and (self.site is None or rec.site == self.site)
+                and (self.follow is None or rec.ip == self.follow))
 
     def _request_pane(self, height: int, width: int) -> list:
         p = self.p
@@ -592,7 +658,7 @@ class Screen:
         recs = matches[back: back + want]
         recs.reverse()  # oldest at the top, newest at the bottom
 
-        filt = "all codes" if self.filter == "all" else self.filter
+        filt = self._filter_label()
         who = self.follow or "all IPs"
         if back:
             last = len(matches) - back
@@ -603,13 +669,19 @@ class Screen:
                             + (" · paused" if back else ""), right, pane="requests")]
         ip_w = max([self.IP_COL_MIN] + [len(r.ip) for r in recs])
         ip_w = min(ip_w, self.IP_COL_MAX)
+        # Site column only with several logs (and not when narrowed to one
+        # site: the title says it); sized to the rows in view.
+        site_w = (site_width(r.site for r in recs)
+                  if len(self.sites) > 1 and self.site is None else 0)
         for rec in recs:
             color = p.style_for(rec.status)
+            site_col = f"{fit(rec.site, site_w)} " if site_w else ""
             ip_col = "" if self.follow else f"{p.CYAN}{rec.ip:<{ip_w}}{p.RESET} "
             lines.append(
                 f"  {p.DIM}{rec.time[11:]:<8}{p.RESET}  "
                 f"{color}{marker(rec.status)} {rec.status:<3}{p.RESET}  "
-                f"{p.WHITE}{rec.method:<6}{p.RESET} {ip_col}{p.DIM}{rec.uri}{p.RESET}"
+                f"{p.WHITE}{rec.method:<6}{p.RESET} {site_col}{ip_col}"
+                f"{p.DIM}{rec.uri}{p.RESET}"
             )
         if not recs:
             lines.append(f"  {p.DIM}(no matching requests in the recent buffer){p.RESET}")
